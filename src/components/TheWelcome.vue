@@ -1,16 +1,20 @@
 <script setup lang="ts">
 import { ref } from 'vue'
- 
-const counter = ref(0);
+import PouchDB from 'pouchdb'
+
+mounted() {
+    this.initDatabase()
+}
+
+const counter = ref(0)
 const increment = () => {
-counter.value++
- 
+  counter.value++
 }
 const openReadmeInEditor = () => fetch('/__open-in-editor?file=README.md')
 </script>
 
 <template>
   <h1>Welcome</h1>
-  <p>Counter: {{counter}}</p>
+  <p>Counter: {{ counter }}</p>
   <button @click="increment"></button>
 </template>
