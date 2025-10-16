@@ -1,18 +1,9 @@
 {
+  "_id": "7a02bd491b358170164a81efd70000db",
+  "_rev": "3-c8319d17943383111cc5b6a13ab0fbad",
   "post_name": "New York",
   "post_content": "Lorem ipsum dolor sit amet",
-  "attributes": {
-    "creation_date": "today",
-    "author": "Ines"
-  },
-  "comment": [
-    {
-      "comment": "Comment 1",
-      "author": "author 1"
-    },
-    {
-      "comment": "Comment 2",
-      "author": "author 2"
-    }
+  "attributes": [
+    "today"
   ]
 }
