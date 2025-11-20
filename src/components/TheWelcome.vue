@@ -1,65 +1,130 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { onMounted, ref, watch } from 'vue'
 import PouchDB from 'pouchdb'
+import PouchFind from 'pouchdb-find'
 
-// ---------- Types ----------
-declare interface Post {
+PouchDB.plugin(PouchFind)
+
+// types
+interface Comment {
+  id: string
+  author: string
+  text: string
+  created_at: string
+}
+
+interface Post {
   _id?: string
   _rev?: string
   post_name: string
   post_content: string
   attributes: string[]
+  likes: number
+  comments: Comment[]
 }
 
-// ---------- State ----------
-const storage = ref<PouchDB.Database | null>(null)
+// state
+const remoteDb = ref<PouchDB.Database | null>(null)
+const localDb = ref<PouchDB.Database | null>(null)
+
 const postsData = ref<Post[]>([])
 
 const newPost = ref<Post>({
   post_name: '',
   post_content: '',
   attributes: [],
+  likes: 0,
+  comments: [],
 })
 
 const editingPost = ref<Post | null>(null)
 
-// ---------- Init DB ----------
-const initDatabase = () => {
-  console.log('=> Connexion à la base de données')
-  // ⚠️ Garde ton URL/base ou adapte si besoin
-  const db = new PouchDB('http://admin:Infradon2_25!@localhost:5984/infradon2_db1')
-  if (db) {
-    console.log('Connecté à la collection : ' + db.name)
-    storage.value = db
-  } else {
-    console.warn('Échec lors de la connexion à la base de données')
-  }
+const searchTerm = ref('')
+const sortByLikes = ref(false)
+const isOnline = ref(true)
+
+const commentingPostId = ref<string | null>(null)
+const newCommentText = ref('')
+
+// init db
+const initDatabases = async () => {
+  const remote = new PouchDB('http://admin:Infradon2_25!@localhost:5984/infradon2_db1')
+  const local = new PouchDB('infradon2_local')
+
+  remoteDb.value = remote
+  localDb.value = local
+
+  await createIndexes()
+  await syncFromRemote()
 }
 
-// ---------- Read ----------
+// index
+const createIndexes = async () => {
+  if (!localDb.value) return
+
+  await localDb.value.createIndex({
+    index: { fields: ['post_name'] },
+  })
+
+  await localDb.value.createIndex({
+    index: { fields: ['likes'] },
+  })
+}
+
+// read all (local)
 const fetchData = async () => {
-  if (!storage.value) return console.warn('Base de données non initialisée')
+  if (!localDb.value) return
 
   try {
-    const result = await storage.value.allDocs({ include_docs: true })
+    const result = await localDb.value.allDocs({ include_docs: true })
     postsData.value = result.rows
       .map((row: any) => row.doc as Post)
       .filter((doc: unknown): doc is Post => !!doc)
-    console.log('📥 Documents récupérés :', postsData.value)
   } catch (error) {
-    console.error('❌ Erreur lors de la récupération des données :', error)
+    console.error('Erreur fetchData :', error)
   }
 }
 
-// ---------- Create ----------
+// réplication serveur -> local
+const syncFromRemote = async () => {
+  if (!remoteDb.value || !localDb.value) return
+
+  try {
+    await PouchDB.replicate(remoteDb.value, localDb.value)
+    await fetchData()
+  } catch (error) {
+    console.error('Erreur syncFromRemote :', error)
+  }
+}
+
+// réplication local -> serveur
+const syncToRemote = async () => {
+  if (!remoteDb.value || !localDb.value) return
+
+  try {
+    await PouchDB.replicate(localDb.value, remoteDb.value)
+  } catch (error) {
+    console.error('Erreur syncToRemote :', error)
+  }
+}
+
+// sync complète (bouton)
+const fullSync = async () => {
+  await syncToRemote()
+  await syncFromRemote()
+}
+
+// create
 const addPost = async () => {
-  if (!storage.value) return
+  if (!localDb.value) return
 
   const doc: Post = {
-    _id: new Date().toISOString(), // ID unique simple
+    _id: new Date().toISOString(),
     post_name: newPost.value.post_name.trim(),
     post_content: newPost.value.post_content.trim(),
     attributes: (newPost.value.attributes || []).map((a) => String(a).trim()).filter(Boolean),
+    likes: 0,
+    comments: [],
   }
 
   if (!doc.post_name || !doc.post_content) {
@@ -68,20 +133,18 @@ const addPost = async () => {
   }
 
   try {
-    await storage.value.put(doc)
-    // Reset formulaire
+    await localDb.value.put(doc)
     newPost.value.post_name = ''
     newPost.value.post_content = ''
     newPost.value.attributes = []
     await fetchData()
   } catch (error) {
-    console.error('❌ Erreur lors de l’ajout :', error)
+    console.error('Erreur addPost :', error)
   }
 }
 
-// ---------- Update (edit inline) ----------
+// update
 const startEdit = (post: Post) => {
-  // copie profonde simple
   editingPost.value = JSON.parse(JSON.stringify(post))
 }
 
@@ -90,58 +153,198 @@ const cancelEdit = () => {
 }
 
 const updatePost = async () => {
-  if (!storage.value) return
+  if (!localDb.value) return
   const doc = editingPost.value
   if (!doc || !doc._id || !doc._rev) {
-    console.warn('⚠️ _id et _rev requis pour la mise à jour')
+    console.warn('_id et _rev requis')
     return
   }
 
-  // nettoyage minimal
   doc.post_name = doc.post_name.trim()
   doc.post_content = doc.post_content.trim()
   doc.attributes = (doc.attributes || []).map((a) => String(a).trim()).filter(Boolean)
 
   try {
-    const res = await storage.value.put(doc)
-    console.log('✅ Document mis à jour :', res)
+    await localDb.value.put(doc)
     editingPost.value = null
     await fetchData()
   } catch (error) {
-    console.error('❌ Erreur lors de la mise à jour :', error)
-    // Optionnel: gestion simple des conflits (_conflict)
+    console.error('Erreur updatePost :', error)
   }
 }
 
-// ---------- Delete ----------
+// delete
 const deletePost = async (docId?: string, docRev?: string) => {
-  if (!storage.value || !docId || !docRev) return
+  if (!localDb.value || !docId || !docRev) return
 
   try {
-    await storage.value.remove(docId, docRev)
+    await localDb.value.remove(docId, docRev)
     await fetchData()
   } catch (error) {
-    console.error('❌ Erreur lors de la suppression :', error)
+    console.error('Erreur deletePost :', error)
   }
 }
 
+// likes
+const likePost = async (post: Post) => {
+  if (!localDb.value || !post._id) return
+  try {
+    const current = (await localDb.value.get(post._id)) as Post
+    current.likes = (current.likes || 0) + 1
+    await localDb.value.put(current)
+    await fetchData()
+  } catch (error) {
+    console.error('Erreur likePost :', error)
+  }
+}
+
+// commentaires
+const startComment = (postId: string) => {
+  commentingPostId.value = postId
+  newCommentText.value = ''
+}
+
+const addComment = async (post: Post) => {
+  if (!localDb.value || !post._id) return
+  if (!newCommentText.value.trim()) return
+
+  try {
+    const current = (await localDb.value.get(post._id)) as Post
+    const comments = current.comments || []
+
+    comments.push({
+      id: new Date().toISOString(),
+      author: 'Anonyme',
+      text: newCommentText.value.trim(),
+      created_at: new Date().toISOString(),
+    })
+
+    current.comments = comments
+    await localDb.value.put(current)
+    commentingPostId.value = null
+    newCommentText.value = ''
+    await fetchData()
+  } catch (error) {
+    console.error('Erreur addComment :', error)
+  }
+}
+
+const deleteComment = async (post: Post, commentId: string) => {
+  if (!localDb.value || !post._id) return
+
+  try {
+    const current = (await localDb.value.get(post._id)) as Post
+    current.comments = (current.comments || []).filter((c) => c.id !== commentId)
+    await localDb.value.put(current)
+    await fetchData()
+  } catch (error) {
+    console.error('Erreur deleteComment :', error)
+  }
+}
+
+// recherche + tri avec find()
+const runQuery = async () => {
+  if (!localDb.value) return
+
+  const term = searchTerm.value.trim()
+  const selector: any = {}
+
+  if (term) {
+    selector.post_name = { $regex: term }
+  }
+
+  let sort: any[] | undefined
+  if (sortByLikes.value) {
+    selector.likes = { $gte: 0 }
+    sort = [{ likes: 'desc' }]
+  }
+
+  try {
+    const query: any = {
+      selector: Object.keys(selector).length ? selector : { _id: { $gte: null } },
+    }
+
+    if (sort) {
+      query.sort = sort
+    }
+
+    const result = await localDb.value.find(query)
+    postsData.value = result.docs as Post[]
+  } catch (error) {
+    console.error('Erreur runQuery :', error)
+  }
+}
+
+// factory
+const createFakePost = (i: number): Post => ({
+  post_name: `Message ${i}`,
+  post_content: `Contenu du message ${i}`,
+  attributes: ['demo', i % 2 === 0 ? 'pair' : 'impair'],
+  likes: Math.floor(Math.random() * 20),
+  comments: [],
+})
+
+const addManyFakePosts = async (count = 20) => {
+  if (!localDb.value) return
+  const docs: any[] = []
+
+  for (let i = 0; i < count; i++) {
+    const now = new Date().toISOString() + `-${i}`
+    docs.push({
+      _id: now,
+      ...createFakePost(i),
+    })
+  }
+
+  try {
+    await localDb.value.bulkDocs(docs)
+    await fetchData()
+  } catch (error) {
+    console.error('Erreur addManyFakePosts :', error)
+  }
+}
+
+// watchers
+watch(isOnline, async (value) => {
+  if (value) {
+    await fullSync()
+  }
+})
+
+watch([searchTerm, sortByLikes], () => {
+  runQuery()
+})
+
+// lifecycle
 onMounted(async () => {
-  console.log('=> Composant initialisé')
-  initDatabase()
-  await fetchData()
+  await initDatabases()
 })
 </script>
 
 <template>
   <div class="container">
-    <h1>📡 CouchDB + Vue 3 (CRUD)</h1>
+    <h1>InfraDon - CouchDB + Vue 3</h1>
 
-    <!-- Actions -->
     <div class="actions">
-      <button @click="fetchData">🔄 Rafraîchir</button>
+      <button @click="fetchData">Rafraîchir (local)</button>
+      <button @click="fullSync" :disabled="!isOnline">Synchroniser avec le serveur</button>
+
+      <label class="inline-label">
+        <input type="checkbox" v-model="isOnline" />
+        Mode online
+      </label>
+
+      <button @click="addManyFakePosts(20)">Générer 20 faux messages</button>
     </div>
 
-    <!-- 📝 Formulaire d'ajout -->
+    <div class="search-bar">
+      <input v-model="searchTerm" type="text" placeholder="Rechercher par nom" />
+      <label class="inline-label">
+        <input type="checkbox" v-model="sortByLikes" />
+        Trier par likes
+      </label>
+    </div>
+
     <div class="form">
       <h2>Ajouter un document</h2>
 
@@ -152,7 +355,7 @@ onMounted(async () => {
         type="text"
       />
       <input
-        v-model="newPost.attributes"
+        :value="(newPost.attributes || []).join(', ')"
         placeholder="Attributs séparés par des virgules"
         type="text"
         @input="newPost.attributes = ($event.target as HTMLInputElement).value.split(',')"
@@ -162,27 +365,46 @@ onMounted(async () => {
 
     <hr />
 
-    <!-- 📃 Liste des documents -->
     <div v-if="postsData.length === 0">
       <p>Aucune donnée trouvée.</p>
     </div>
 
     <article v-for="post in postsData" :key="post._id" class="item">
-      <!-- Affichage normal -->
+      <!-- vue normale -->
       <template v-if="!editingPost || editingPost._id !== post._id">
         <h2>{{ post.post_name }}</h2>
         <p>{{ post.post_content }}</p>
         <p>Attributs : {{ (post.attributes || []).join(', ') }}</p>
+        <p>Likes : {{ post.likes || 0 }}</p>
+
         <div class="row">
-          <button @click="startEdit(post)">✏️ Modifier</button>
-          <button @click="deletePost(post._id, post._rev)">🗑️ Supprimer</button>
+          <button @click="likePost(post)">{{ post.likes > 0 ? '❤️' : '🤍' }} Like</button>
+
+          <button @click="startEdit(post)">Modifier</button>
+          <button @click="deletePost(post._id, post._rev)">Supprimer</button>
+        </div>
+
+        <div class="comments">
+          <h4>Commentaires ({{ post.comments?.length || 0 }})</h4>
+          <ul>
+            <li v-for="c in post.comments" :key="c.id">
+              <strong>{{ c.author }}</strong> — {{ c.text }}
+              <button @click="deleteComment(post, c.id)">Supprimer</button>
+            </li>
+          </ul>
+
+          <div v-if="commentingPostId === post._id" class="comment-form">
+            <input v-model="newCommentText" type="text" placeholder="Votre commentaire" />
+            <button @click="addComment(post)">Envoyer</button>
+          </div>
+          <button v-else @click="startComment(post._id!)">Ajouter un commentaire</button>
         </div>
       </template>
 
-      <!-- Mode édition -->
+      <!-- mode édition -->
       <template v-else>
         <div class="editBox">
-          <h3>✏️ Modifier le document</h3>
+          <h3>Modifier le document</h3>
           <input v-model="editingPost.post_name" placeholder="Nom (post_name)" type="text" />
           <input
             v-model="editingPost.post_content"
@@ -201,8 +423,8 @@ onMounted(async () => {
             "
           />
           <div class="row">
-            <button @click="updatePost">✅ Enregistrer</button>
-            <button @click="cancelEdit">❌ Annuler</button>
+            <button @click="updatePost">Enregistrer</button>
+            <button @click="cancelEdit">Annuler</button>
           </div>
         </div>
       </template>
@@ -212,51 +434,226 @@ onMounted(async () => {
 
 <style scoped>
 .container {
-  padding: 1.5rem;
-  color: white;
-  max-width: 720px;
-  margin: auto;
-}
-.actions {
-  margin-bottom: 1rem;
-}
-.form {
+  min-height: 100vh;
+  padding: 2rem 1.5rem;
+  max-width: 960px;
+  margin: 0 auto;
+  color: #f5f5f5;
   display: flex;
   flex-direction: column;
-  gap: 0.5rem;
-  margin-bottom: 1.5rem;
+  gap: 1.5rem;
 }
+
+/* Barre d’actions en haut */
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  align-items: center;
+}
+
+.search-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+
+.inline-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.9rem;
+  opacity: 0.9;
+}
+
+/* Carte formulaire */
+.form {
+  background: linear-gradient(135deg, #1f2933, #111827);
+  border-radius: 12px;
+  padding: 1.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  box-shadow: 0 14px 30px rgba(0, 0, 0, 0.35);
+}
+
+.form h2 {
+  margin: 0 0 0.5rem;
+}
+
+/* Inputs + boutons */
 input {
-  padding: 0.5rem;
-  border-radius: 4px;
-  border: none;
+  padding: 0.6rem 0.75rem;
+  border-radius: 8px;
+  border: 1px solid #374151;
+  background: #111827;
+  color: #f9fafb;
+  font-size: 0.95rem;
+  transition:
+    border-color 0.15s ease,
+    box-shadow 0.15s ease,
+    background 0.15s ease;
 }
+
+input::placeholder {
+  color: #6b7280;
+}
+
+input:focus {
+  outline: none;
+  border-color: #10b981;
+  box-shadow: 0 0 0 1px rgba(16, 185, 129, 0.6);
+  background: #020617;
+}
+
 button {
-  background: #42b883;
-  color: white;
-  padding: 0.5rem;
+  background: linear-gradient(135deg, #10b981, #059669);
+  color: #f9fafb;
+  padding: 0.55rem 0.9rem;
   border: none;
   cursor: pointer;
-  border-radius: 4px;
+  border-radius: 999px;
+  font-size: 0.9rem;
+  font-weight: 500;
+  transition:
+    transform 0.12s ease,
+    box-shadow 0.12s ease,
+    opacity 0.12s ease,
+    background 0.12s ease;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.25rem;
 }
+
 button:hover {
-  background: #2a9d6e;
+  transform: translateY(-1px);
+  box-shadow: 0 10px 20px rgba(16, 185, 129, 0.35);
 }
+
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+  box-shadow: none;
+  transform: none;
+}
+
+/* Boutons secondaires dans les cartes */
+.item .row button:nth-child(2) {
+  background: linear-gradient(135deg, #3b82f6, #2563eb);
+}
+
+.item .row button:nth-child(3),
+.comments button:last-child {
+  background: linear-gradient(135deg, #ef4444, #b91c1c);
+}
+
+/* Carte d’un post */
 .item {
-  background: #1e1e1e;
-  padding: 1rem;
+  background: #020617;
+  border-radius: 14px;
+  padding: 1.25rem 1.25rem 1rem;
   margin-top: 0.75rem;
-  border-radius: 6px;
+  box-shadow: 0 14px 30px rgba(0, 0, 0, 0.45);
+  border: 1px solid rgba(55, 65, 81, 0.6);
 }
+
+.item h2 {
+  margin: 0 0 0.15rem;
+}
+
+.item p {
+  margin: 0.25rem 0;
+  color: #e5e7eb;
+  font-size: 0.95rem;
+}
+
+.item p:nth-of-type(3) {
+  font-size: 0.85rem;
+  color: #9ca3af;
+}
+
+/* Ligne de boutons d’un post */
 .row {
   display: flex;
+  flex-wrap: wrap;
   gap: 0.5rem;
   margin-top: 0.75rem;
 }
+
+/* Bloc édition */
 .editBox {
   padding: 1rem;
-  border: 2px solid #42b883;
-  border-radius: 8px;
-  background: #17221f;
+  border-radius: 12px;
+  border: 1px solid #10b981;
+  background: radial-gradient(circle at top left, #064e3b, #020617);
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.editBox h3 {
+  margin: 0 0 0.5rem;
+}
+
+/* Commentaires */
+.comments {
+  margin-top: 1rem;
+  border-top: 1px solid #111827;
+  padding-top: 0.75rem;
+}
+
+.comments h4 {
+  margin: 0 0 0.4rem;
+  font-size: 0.9rem;
+  color: #d1d5db;
+}
+
+.comments ul {
+  list-style: none;
+  padding-left: 0;
+  margin: 0 0 0.4rem;
+}
+
+.comments li {
+  margin-bottom: 0.3rem;
+  font-size: 0.85rem;
+  color: #e5e7eb;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.comments li strong {
+  color: #a5b4fc;
+}
+
+.comment-form {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.4rem;
+}
+
+/* Responsive */
+@media (max-width: 720px) {
+  .container {
+    padding: 1.25rem 1rem;
+  }
+
+  .form,
+  .item {
+    padding: 1rem;
+  }
+
+  .comment-form {
+    flex-direction: column;
+  }
+
+  .actions,
+  .search-bar {
+    flex-direction: column;
+    align-items: flex-start;
+  }
 }
 </style>
