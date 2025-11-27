@@ -46,6 +46,20 @@ const isOnline = ref(true)
 const commentingPostId = ref<string | null>(null)
 const newCommentText = ref('')
 
+// édition de commentaire
+const editingComment = ref<{
+  postId: string
+  commentId: string
+  text: string
+} | null>(null)
+
+// visibilité des commentaires par post
+const commentsVisibility = ref<Record<string, boolean>>({})
+
+const toggleCommentsVisibility = (postId: string) => {
+  commentsVisibility.value[postId] = !commentsVisibility.value[postId]
+}
+
 // init db
 const initDatabases = async () => {
   const remote = new PouchDB('http://admin:Infradon2_25!@localhost:5984/infradon2_db1')
@@ -82,6 +96,22 @@ const fetchData = async () => {
       .filter((doc: unknown): doc is Post => !!doc)
   } catch (error) {
     console.error('Erreur fetchData :', error)
+  }
+}
+
+// afficher les 10 documents les plus likés (côté DB)
+const fetchTop10Liked = async () => {
+  if (!localDb.value) return
+
+  try {
+    const result = await localDb.value.find({
+      selector: { likes: { $gte: 0 } },
+      sort: [{ likes: 'desc' }],
+      limit: 10,
+    })
+    postsData.value = result.docs as Post[]
+  } catch (error) {
+    console.error('Erreur fetchTop10Liked :', error)
   }
 }
 
@@ -143,7 +173,7 @@ const addPost = async () => {
   }
 }
 
-// update
+// update post
 const startEdit = (post: Post) => {
   editingPost.value = JSON.parse(JSON.stringify(post))
 }
@@ -173,7 +203,7 @@ const updatePost = async () => {
   }
 }
 
-// delete
+// delete post
 const deletePost = async (docId?: string, docRev?: string) => {
   if (!localDb.value || !docId || !docRev) return
 
@@ -202,6 +232,7 @@ const likePost = async (post: Post) => {
 const startComment = (postId: string) => {
   commentingPostId.value = postId
   newCommentText.value = ''
+  editingComment.value = null
 }
 
 const addComment = async (post: Post) => {
@@ -239,6 +270,39 @@ const deleteComment = async (post: Post, commentId: string) => {
     await fetchData()
   } catch (error) {
     console.error('Erreur deleteComment :', error)
+  }
+}
+
+// édition de commentaire
+const startEditComment = (post: Post, comment: Comment) => {
+  if (!post._id) return
+  editingComment.value = {
+    postId: post._id,
+    commentId: comment.id,
+    text: comment.text,
+  }
+  commentingPostId.value = null
+}
+
+const cancelEditComment = () => {
+  editingComment.value = null
+}
+
+const updateComment = async (post: Post) => {
+  if (!localDb.value || !post._id || !editingComment.value) return
+
+  try {
+    const current = (await localDb.value.get(post._id)) as Post
+    current.comments = (current.comments || []).map((c) =>
+      c.id === editingComment.value!.commentId
+        ? { ...c, text: editingComment.value!.text.trim() }
+        : c,
+    )
+    await localDb.value.put(current)
+    editingComment.value = null
+    await fetchData()
+  } catch (error) {
+    console.error('Erreur updateComment :', error)
   }
 }
 
@@ -335,6 +399,7 @@ onMounted(async () => {
       </label>
 
       <button @click="addManyFakePosts(20)">Générer 20 faux messages</button>
+      <button @click="fetchTop10Liked">Top 10 les plus likés</button>
     </div>
 
     <div class="search-bar">
@@ -386,13 +451,66 @@ onMounted(async () => {
 
         <div class="comments">
           <h4>Commentaires ({{ post.comments?.length || 0 }})</h4>
-          <ul>
-            <li v-for="c in post.comments" :key="c.id">
-              <strong>{{ c.author }}</strong> — {{ c.text }}
-              <button @click="deleteComment(post, c.id)">Supprimer</button>
-            </li>
-          </ul>
 
+          <!-- Premier commentaire (une seule fois) -->
+          <div v-if="post.comments?.length" class="first-comment">
+            <p>
+              <strong>Premier commentaire :</strong><br />
+              <strong>{{ post.comments[0].author }}</strong> — {{ post.comments[0].text }}
+            </p>
+
+            <div class="row">
+              <button @click="startEditComment(post, post.comments[0])">Modifier</button>
+              <button @click="deleteComment(post, post.comments[0].id)">Supprimer</button>
+            </div>
+          </div>
+
+          <!-- Aucun commentaire -->
+          <div v-else>
+            <p>Aucun commentaire pour l’instant.</p>
+          </div>
+
+          <!-- Bouton pour afficher les autres -->
+          <div v-if="post.comments && post.comments.length > 1">
+            <button class="toggle-btn" @click="toggleCommentsVisibility(post._id!)">
+              {{
+                commentsVisibility[post._id!]
+                  ? 'Masquer les autres commentaires'
+                  : 'Afficher les autres commentaires'
+              }}
+            </button>
+
+            <!-- Les AUTRES commentaires (sauf le premier) -->
+            <ul v-if="commentsVisibility[post._id!]">
+              <li v-for="c in post.comments.slice(1)" :key="c.id">
+                <template
+                  v-if="
+                    editingComment &&
+                    editingComment.postId === post._id &&
+                    editingComment.commentId === c.id
+                  "
+                >
+                  <input v-model="editingComment.text" type="text" />
+                  <div class="row">
+                    <button @click="updateComment(post)">Enregistrer</button>
+                    <button @click="cancelEditComment">Annuler</button>
+                  </div>
+                </template>
+
+                <template v-else>
+                  <span>
+                    <strong>{{ c.author }}</strong> — {{ c.text }}
+                  </span>
+                  <div class="row">
+                    <button @click="startEditComment(post, c)">Modifier</button>
+                    <button @click="deleteComment(post, c.id)">Supprimer</button>
+                  </div>
+                </template>
+              </li>
+            </ul>
+          </div>
+
+          <!-- Formulaire d'ajout -->
           <div v-if="commentingPostId === post._id" class="comment-form">
             <input v-model="newCommentText" type="text" placeholder="Votre commentaire" />
             <button @click="addComment(post)">Envoyer</button>
@@ -401,7 +519,7 @@ onMounted(async () => {
         </div>
       </template>
 
-      <!-- mode édition -->
+      <!-- mode édition post -->
       <template v-else>
         <div class="editBox">
           <h3>Modifier le document</h3>
@@ -447,7 +565,7 @@ onMounted(async () => {
 /* Barre d’actions en haut */
 .actions {
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: wrap; /* passe sur plusieurs lignes si petit écran */
   gap: 0.75rem;
   align-items: center;
 }
@@ -538,13 +656,14 @@ button:disabled {
   transform: none;
 }
 
-/* Boutons secondaires dans les cartes */
+/* Boutons secondaires dans les cartes (Modifier / Supprimer) */
 .item .row button:nth-child(2) {
   background: linear-gradient(135deg, #3b82f6, #2563eb);
 }
 
 .item .row button:nth-child(3),
 .comments button:last-child {
+  /* Supprimer / Ajouter un commentaire */
   background: linear-gradient(135deg, #ef4444, #b91c1c);
 }
 
@@ -573,7 +692,7 @@ button:disabled {
   color: #9ca3af;
 }
 
-/* Ligne de boutons d’un post */
+/* Ligne de boutons d’un post (like / modifier / supprimer) */
 .row {
   display: flex;
   flex-wrap: wrap;
@@ -581,7 +700,7 @@ button:disabled {
   margin-top: 0.75rem;
 }
 
-/* Bloc édition */
+/* Bloc édition d’un post */
 .editBox {
   padding: 1rem;
   border-radius: 12px;
@@ -620,19 +739,44 @@ button:disabled {
   font-size: 0.85rem;
   color: #e5e7eb;
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 0.5rem;
+  flex-direction: column;
+  gap: 0.4rem;
 }
 
 .comments li strong {
   color: #a5b4fc;
 }
 
+/* Premier commentaire (aperçu) */
+.first-comment {
+  font-size: 0.88rem;
+  margin-bottom: 0.4rem;
+  color: #e5e7eb;
+}
+
+/* Formulaire d’ajout de commentaire */
 .comment-form {
   display: flex;
   gap: 0.5rem;
   margin-top: 0.4rem;
+}
+
+/* Bouton "Afficher tous les commentaires" - discret */
+.toggle-btn {
+  background: transparent !important;
+  color: #94a3b8;
+  border: 1px solid #334155;
+  font-size: 0.8rem;
+  padding: 0.25rem 0.7rem;
+  border-radius: 999px;
+  opacity: 0.9;
+  margin: 0.5rem 0 0.2rem;
+  box-shadow: none !important;
+}
+
+.toggle-btn:hover {
+  background: #020617 !important;
+  color: #e5e7eb;
 }
 
 /* Responsive */
