@@ -5,39 +5,45 @@ import PouchFind from 'pouchdb-find'
 
 PouchDB.plugin(PouchFind)
 
-// types
-interface Comment {
-  id: string
+/** ========= Types ========= */
+type DocType = 'post' | 'comment'
+
+interface PostDoc {
+  _id?: string
+  _rev?: string
+  type: 'post'
+  post_name: string
+  post_content: string
+  attributes: string[]
+  likes: number
+  created_at: string
+}
+
+interface CommentDoc {
+  _id?: string
+  _rev?: string
+  type: 'comment'
+  postId: string
   author: string
   text: string
   created_at: string
 }
 
-interface Post {
-  _id?: string
-  _rev?: string
-  post_name: string
-  post_content: string
-  attributes: string[]
-  likes: number
-  comments: Comment[]
-}
-
-// state
+/** ========= DB ========= */
 const remoteDb = ref<PouchDB.Database | null>(null)
 const localDb = ref<PouchDB.Database | null>(null)
+const syncHandler = ref<PouchDB.Replication.Sync<{}> | null>(null)
 
-const postsData = ref<Post[]>([])
+/** ========= UI state ========= */
+const postsData = ref<PostDoc[]>([])
 
-const newPost = ref<Post>({
+const newPost = ref({
   post_name: '',
   post_content: '',
-  attributes: [],
-  likes: 0,
-  comments: [],
+  attributes: [] as string[],
 })
 
-const editingPost = ref<Post | null>(null)
+const editingPost = ref<PostDoc | null>(null)
 
 const searchTerm = ref('')
 const sortByLikes = ref(false)
@@ -46,21 +52,43 @@ const isOnline = ref(true)
 const commentingPostId = ref<string | null>(null)
 const newCommentText = ref('')
 
-// édition de commentaire
 const editingComment = ref<{
   postId: string
   commentId: string
   text: string
 } | null>(null)
 
-// visibilité des commentaires par post
 const commentsVisibility = ref<Record<string, boolean>>({})
 
-const toggleCommentsVisibility = (postId: string) => {
-  commentsVisibility.value[postId] = !commentsVisibility.value[postId]
+/** ========= Comment cache (minimal data) ========= */
+const firstCommentByPost = ref<Record<string, CommentDoc | null>>({})
+const otherCommentsByPost = ref<Record<string, CommentDoc[]>>({})
+
+/** ========= Helpers ========= */
+const nowIso = () => new Date().toISOString()
+
+// petit helper anti-conflit : re-get et retry (utile pour likes, edits)
+const putWithRetry = async <T extends { _id?: string; _rev?: string }>(
+  draft: T,
+  merge: (latest: T) => T,
+  maxRetry = 2,
+) => {
+  if (!localDb.value || !draft._id) throw new Error('DB or _id missing')
+  try {
+    return await localDb.value.put(draft as any)
+  } catch (e: any) {
+    if (e?.status === 409 && maxRetry > 0) {
+      const latest = (await localDb.value.get(draft._id)) as T
+      const merged = merge(latest)
+      merged._id = latest._id
+      merged._rev = latest._rev
+      return await putWithRetry(merged, merge, maxRetry - 1)
+    }
+    throw e
+  }
 }
 
-// init db
+/** ========= Init / Indexes ========= */
 const initDatabases = async () => {
   const remote = new PouchDB('http://admin:Infradon2_25!@localhost:5984/infradon2_db1')
   const local = new PouchDB('infradon2_local')
@@ -69,97 +97,124 @@ const initDatabases = async () => {
   localDb.value = local
 
   await createIndexes()
-  await syncFromRemote()
+  await startLiveSync()
+  await fetchPosts()
 }
 
-// index
 const createIndexes = async () => {
   if (!localDb.value) return
 
+  // Posts: search
   await localDb.value.createIndex({
-    index: { fields: ['post_name'] },
+    index: { fields: ['type', 'post_name'] },
   })
 
+  // Posts: sort likes
   await localDb.value.createIndex({
-    index: { fields: ['likes'] },
+    index: { fields: ['type', 'likes'] },
+  })
+
+  // Comments: by post + date
+  await localDb.value.createIndex({
+    index: { fields: ['type', 'postId', 'created_at'] },
   })
 }
 
-// read all (local)
-const fetchData = async () => {
-  if (!localDb.value) return
-
-  try {
-    const result = await localDb.value.allDocs({ include_docs: true })
-    postsData.value = result.rows
-      .map((row: any) => row.doc as Post)
-      .filter((doc: unknown): doc is Post => !!doc)
-  } catch (error) {
-    console.error('Erreur fetchData :', error)
+/** ========= Sync (plus robuste que replicate "one shot") ========= */
+const stopLiveSync = () => {
+  if (syncHandler.value) {
+    syncHandler.value.cancel()
+    syncHandler.value = null
   }
 }
 
-// afficher les 10 documents les plus likés (côté DB)
-const fetchTop10Liked = async () => {
-  if (!localDb.value) return
+const startLiveSync = async () => {
+  if (!localDb.value || !remoteDb.value) return
+  stopLiveSync()
 
-  try {
-    const result = await localDb.value.find({
-      selector: { likes: { $gte: 0 } },
-      sort: [{ likes: 'desc' }],
-      limit: 10,
+  syncHandler.value = localDb.value
+    .sync(remoteDb.value, { live: true, retry: true })
+    .on('change', async () => {
+      // refresh simple et fiable
+      await fetchPosts()
     })
-    postsData.value = result.docs as Post[]
-  } catch (error) {
-    console.error('Erreur fetchTop10Liked :', error)
-  }
+    .on('error', (err) => console.error('Sync error:', err))
 }
 
-// réplication serveur -> local
-const syncFromRemote = async () => {
-  if (!remoteDb.value || !localDb.value) return
-
-  try {
-    await PouchDB.replicate(remoteDb.value, localDb.value)
-    await fetchData()
-  } catch (error) {
-    console.error('Erreur syncFromRemote :', error)
-  }
-}
-
-// réplication local -> serveur
-const syncToRemote = async () => {
-  if (!remoteDb.value || !localDb.value) return
-
+// bouton sync manuel si tu veux le garder
+const fullSyncOnce = async () => {
+  if (!localDb.value || !remoteDb.value) return
   try {
     await PouchDB.replicate(localDb.value, remoteDb.value)
-  } catch (error) {
-    console.error('Erreur syncToRemote :', error)
+    await PouchDB.replicate(remoteDb.value, localDb.value)
+    await fetchPosts()
+  } catch (e) {
+    console.error('Erreur fullSyncOnce:', e)
   }
 }
 
-// sync complète (bouton)
-const fullSync = async () => {
-  await syncToRemote()
-  await syncFromRemote()
+/** ========= Queries (NO allDocs) ========= */
+const fetchPosts = async () => {
+  if (!localDb.value) return
+
+  const term = searchTerm.value.trim()
+  const selector: any = { type: 'post' as DocType }
+
+  if (term) selector.post_name = { $regex: term }
+
+  const query: any = {
+    selector,
+    limit: 200, // IMPORTANT: pas 25 par défaut
+  }
+
+  // sort by likes
+  if (sortByLikes.value) {
+    selector.likes = { $gte: 0 }
+    query.sort = [{ type: 'asc' }, { likes: 'desc' }]
+  }
+
+  try {
+    const res = await localDb.value.find(query)
+    postsData.value = res.docs as PostDoc[]
+    await fetchFirstCommentsForPosts(postsData.value)
+  } catch (e) {
+    console.error('Erreur fetchPosts:', e)
+  }
 }
 
-// create
+const fetchTop10Liked = async () => {
+  if (!localDb.value) return
+  try {
+    const res = await localDb.value.find({
+      selector: { type: 'post', likes: { $gte: 0 } },
+      sort: [{ type: 'asc' }, { likes: 'desc' }],
+      limit: 10,
+    })
+    postsData.value = res.docs as PostDoc[]
+    await fetchFirstCommentsForPosts(postsData.value)
+  } catch (e) {
+    console.error('Erreur fetchTop10Liked:', e)
+  }
+}
+
+/** ========= Posts CRUD ========= */
 const addPost = async () => {
   if (!localDb.value) return
 
-  const doc: Post = {
-    _id: new Date().toISOString(),
-    post_name: newPost.value.post_name.trim(),
-    post_content: newPost.value.post_content.trim(),
-    attributes: (newPost.value.attributes || []).map((a) => String(a).trim()).filter(Boolean),
-    likes: 0,
-    comments: [],
-  }
+  const post_name = newPost.value.post_name.trim()
+  const post_content = newPost.value.post_content.trim()
+  const attributes = (newPost.value.attributes || []).map((a) => String(a).trim()).filter(Boolean)
 
-  if (!doc.post_name || !doc.post_content) {
-    console.warn('Champs requis manquants')
-    return
+  if (!post_name || !post_content) return
+
+  const doc: PostDoc = {
+    _id: `post:${nowIso()}`,
+    type: 'post',
+    post_name,
+    post_content,
+    attributes,
+    likes: 0,
+    created_at: nowIso(),
   }
 
   try {
@@ -167,219 +222,255 @@ const addPost = async () => {
     newPost.value.post_name = ''
     newPost.value.post_content = ''
     newPost.value.attributes = []
-    await fetchData()
-  } catch (error) {
-    console.error('Erreur addPost :', error)
+    await fetchPosts()
+  } catch (e) {
+    console.error('Erreur addPost:', e)
   }
 }
 
-// update post
-const startEdit = (post: Post) => {
+const startEdit = (post: PostDoc) => {
   editingPost.value = JSON.parse(JSON.stringify(post))
 }
-
-const cancelEdit = () => {
-  editingPost.value = null
-}
+const cancelEdit = () => (editingPost.value = null)
 
 const updatePost = async () => {
   if (!localDb.value) return
   const doc = editingPost.value
-  if (!doc || !doc._id || !doc._rev) {
-    console.warn('_id et _rev requis')
-    return
-  }
+  if (!doc?._id || !doc._rev) return
 
   doc.post_name = doc.post_name.trim()
   doc.post_content = doc.post_content.trim()
   doc.attributes = (doc.attributes || []).map((a) => String(a).trim()).filter(Boolean)
 
   try {
-    await localDb.value.put(doc)
+    await putWithRetry<PostDoc>(
+      doc,
+      (latest) => ({
+        ...latest,
+        post_name: doc.post_name,
+        post_content: doc.post_content,
+        attributes: doc.attributes,
+      }),
+    )
     editingPost.value = null
-    await fetchData()
-  } catch (error) {
-    console.error('Erreur updatePost :', error)
+    await fetchPosts()
+  } catch (e) {
+    console.error('Erreur updatePost:', e)
   }
 }
 
-// delete post
-const deletePost = async (docId?: string, docRev?: string) => {
-  if (!localDb.value || !docId || !docRev) return
+const deletePost = async (id?: string, rev?: string) => {
+  if (!localDb.value || !id || !rev) return
 
   try {
-    await localDb.value.remove(docId, docRev)
-    await fetchData()
-  } catch (error) {
-    console.error('Erreur deletePost :', error)
+    // delete post
+    await localDb.value.remove(id, rev)
+
+    // delete all linked comments (collection séparée)
+    const commRes = await localDb.value.find({
+      selector: { type: 'comment', postId: id },
+      limit: 500,
+    })
+
+    if (commRes.docs.length) {
+      const toDelete = (commRes.docs as CommentDoc[]).map((c) => ({ ...c, _deleted: true }))
+      await localDb.value.bulkDocs(toDelete as any)
+    }
+
+    await fetchPosts()
+  } catch (e) {
+    console.error('Erreur deletePost:', e)
   }
 }
 
-// likes
-const likePost = async (post: Post) => {
+const likePost = async (post: PostDoc) => {
   if (!localDb.value || !post._id) return
   try {
-    const current = (await localDb.value.get(post._id)) as Post
-    current.likes = (current.likes || 0) + 1
-    await localDb.value.put(current)
-    await fetchData()
-  } catch (error) {
-    console.error('Erreur likePost :', error)
+    const latest = (await localDb.value.get(post._id)) as PostDoc
+    latest.likes = (latest.likes || 0) + 1
+    await putWithRetry<PostDoc>(
+      latest,
+      (l) => ({ ...l, likes: (l.likes || 0) + 1 }),
+    )
+    await fetchPosts()
+  } catch (e) {
+    console.error('Erreur likePost:', e)
   }
 }
 
-// commentaires
+/** ========= Comments ========= */
 const startComment = (postId: string) => {
   commentingPostId.value = postId
   newCommentText.value = ''
   editingComment.value = null
 }
 
-const addComment = async (post: Post) => {
-  if (!localDb.value || !post._id) return
-  if (!newCommentText.value.trim()) return
+const addComment = async (postId: string) => {
+  if (!localDb.value) return
+  const txt = newCommentText.value.trim()
+  if (!txt) return
+
+  const doc: CommentDoc = {
+    _id: `comment:${nowIso()}`,
+    type: 'comment',
+    postId,
+    author: 'Anonyme',
+    text: txt,
+    created_at: nowIso(),
+  }
 
   try {
-    const current = (await localDb.value.get(post._id)) as Post
-    const comments = current.comments || []
-
-    comments.push({
-      id: new Date().toISOString(),
-      author: 'Anonyme',
-      text: newCommentText.value.trim(),
-      created_at: new Date().toISOString(),
-    })
-
-    current.comments = comments
-    await localDb.value.put(current)
-    commentingPostId.value = null
+    await localDb.value.put(doc)
     newCommentText.value = ''
-    await fetchData()
-  } catch (error) {
-    console.error('Erreur addComment :', error)
+    commentingPostId.value = null
+
+    await fetchFirstComment(postId)
+    if (commentsVisibility.value[postId]) await fetchOtherComments(postId)
+  } catch (e) {
+    console.error('Erreur addComment:', e)
   }
 }
 
-const deleteComment = async (post: Post, commentId: string) => {
-  if (!localDb.value || !post._id) return
-
+const deleteComment = async (commentId: string, postId: string) => {
+  if (!localDb.value) return
   try {
-    const current = (await localDb.value.get(post._id)) as Post
-    current.comments = (current.comments || []).filter((c) => c.id !== commentId)
-    await localDb.value.put(current)
-    await fetchData()
-  } catch (error) {
-    console.error('Erreur deleteComment :', error)
+    const doc = (await localDb.value.get(commentId)) as CommentDoc
+    await localDb.value.remove(doc._id!, doc._rev!)
+    await fetchFirstComment(postId)
+    if (commentsVisibility.value[postId]) await fetchOtherComments(postId)
+  } catch (e) {
+    console.error('Erreur deleteComment:', e)
   }
 }
 
-// édition de commentaire
-const startEditComment = (post: Post, comment: Comment) => {
-  if (!post._id) return
-  editingComment.value = {
-    postId: post._id,
-    commentId: comment.id,
-    text: comment.text,
-  }
+const startEditComment = (postId: string, comment: CommentDoc) => {
+  if (!comment._id) return
+  editingComment.value = { postId, commentId: comment._id, text: comment.text }
   commentingPostId.value = null
 }
 
-const cancelEditComment = () => {
-  editingComment.value = null
-}
+const cancelEditComment = () => (editingComment.value = null)
 
-const updateComment = async (post: Post) => {
-  if (!localDb.value || !post._id || !editingComment.value) return
-
+const updateComment = async () => {
+  if (!localDb.value || !editingComment.value) return
   try {
-    const current = (await localDb.value.get(post._id)) as Post
-    current.comments = (current.comments || []).map((c) =>
-      c.id === editingComment.value!.commentId
-        ? { ...c, text: editingComment.value!.text.trim() }
-        : c,
+    const doc = (await localDb.value.get(editingComment.value.commentId)) as CommentDoc
+    doc.text = editingComment.value.text.trim()
+    await putWithRetry<CommentDoc>(
+      doc,
+      (latest) => ({ ...latest, text: doc.text }),
     )
-    await localDb.value.put(current)
+
+    const postId = editingComment.value.postId
     editingComment.value = null
-    await fetchData()
-  } catch (error) {
-    console.error('Erreur updateComment :', error)
+    await fetchFirstComment(postId)
+    if (commentsVisibility.value[postId]) await fetchOtherComments(postId)
+  } catch (e) {
+    console.error('Erreur updateComment:', e)
   }
 }
 
-// recherche + tri avec find()
-const runQuery = async () => {
+/** ========= Minimal comments loading ========= */
+const fetchFirstComment = async (postId: string) => {
   if (!localDb.value) return
-
-  const term = searchTerm.value.trim()
-  const selector: any = {}
-
-  if (term) {
-    selector.post_name = { $regex: term }
-  }
-
-  let sort: any[] | undefined
-  if (sortByLikes.value) {
-    selector.likes = { $gte: 0 }
-    sort = [{ likes: 'desc' }]
-  }
-
   try {
-    const query: any = {
-      selector: Object.keys(selector).length ? selector : { _id: { $gte: null } },
-    }
-
-    if (sort) {
-      query.sort = sort
-    }
-
-    const result = await localDb.value.find(query)
-    postsData.value = result.docs as Post[]
-  } catch (error) {
-    console.error('Erreur runQuery :', error)
+    const res = await localDb.value.find({
+      selector: { type: 'comment', postId },
+      sort: [{ type: 'asc' }, { postId: 'asc' }, { created_at: 'asc' }],
+      limit: 1,
+    })
+    firstCommentByPost.value[postId] = (res.docs[0] as CommentDoc) || null
+  } catch (e) {
+    console.error('Erreur fetchFirstComment:', e)
   }
 }
 
-// factory
-const createFakePost = (i: number): Post => ({
+const fetchFirstCommentsForPosts = async (posts: PostDoc[]) => {
+  await Promise.all(posts.filter(p => p._id).map(p => fetchFirstComment(p._id!)))
+}
+
+const fetchOtherComments = async (postId: string) => {
+  if (!localDb.value) return
+  try {
+    const res = await localDb.value.find({
+      selector: { type: 'comment', postId },
+      sort: [{ type: 'asc' }, { postId: 'asc' }, { created_at: 'asc' }],
+      limit: 500,
+    })
+    const all = res.docs as CommentDoc[]
+    otherCommentsByPost.value[postId] = all.slice(1) // exclude first
+  } catch (e) {
+    console.error('Erreur fetchOtherComments:', e)
+  }
+}
+
+const toggleOtherComments = async (postId: string) => {
+  commentsVisibility.value[postId] = !commentsVisibility.value[postId]
+  if (commentsVisibility.value[postId]) {
+    await fetchOtherComments(postId)
+  }
+}
+
+/** ========= Factory (DB vide -> fonctionne) ========= */
+const createFakePost = (i: number): Omit<PostDoc, '_id' | '_rev'> => ({
+  type: 'post',
   post_name: `Message ${i}`,
   post_content: `Contenu du message ${i}`,
   attributes: ['demo', i % 2 === 0 ? 'pair' : 'impair'],
   likes: Math.floor(Math.random() * 20),
-  comments: [],
+  created_at: nowIso(),
 })
 
-const addManyFakePosts = async (count = 20) => {
+const addManyFakePosts = async (count = 10) => {
   if (!localDb.value) return
+
   const docs: any[] = []
+  const createdPostIds: string[] = []
 
   for (let i = 0; i < count; i++) {
-    const now = new Date().toISOString() + `-${i}`
+    const id = `post:${nowIso()}-${i}`
+    createdPostIds.push(id)
     docs.push({
-      _id: now,
+      _id: id,
       ...createFakePost(i),
-    })
+      created_at: nowIso(),
+    } as PostDoc)
+  }
+
+  // ajoute aussi quelques commentaires séparés
+  for (let i = 0; i < createdPostIds.length; i++) {
+    const postId = createdPostIds[i]
+    const howMany = 1 + Math.floor(Math.random() * 3) // 1 à 3 commentaires
+    for (let j = 0; j < howMany; j++) {
+      docs.push({
+        _id: `comment:${nowIso()}-${i}-${j}`,
+        type: 'comment',
+        postId,
+        author: 'Anonyme',
+        text: `Commentaire ${j + 1} sur ${postId.split(':')[1]}`,
+        created_at: nowIso(),
+      } as CommentDoc)
+    }
   }
 
   try {
     await localDb.value.bulkDocs(docs)
-    await fetchData()
-  } catch (error) {
-    console.error('Erreur addManyFakePosts :', error)
+    await fetchPosts()
+  } catch (e) {
+    console.error('Erreur addManyFakePosts:', e)
   }
 }
 
-// watchers
-watch(isOnline, async (value) => {
-  if (value) {
-    await fullSync()
-  }
-})
-
+/** ========= Watchers / lifecycle ========= */
 watch([searchTerm, sortByLikes], () => {
-  runQuery()
+  fetchPosts()
 })
 
-// lifecycle
+watch(isOnline, async (v) => {
+  if (v) await startLiveSync()
+  else stopLiveSync()
+})
+
 onMounted(async () => {
   await initDatabases()
 })
@@ -390,15 +481,15 @@ onMounted(async () => {
     <h1>InfraDon - CouchDB + Vue 3</h1>
 
     <div class="actions">
-      <button @click="fetchData">Rafraîchir (local)</button>
-      <button @click="fullSync" :disabled="!isOnline">Synchroniser avec le serveur</button>
+      <button @click="fetchPosts">Rafraîchir (find)</button>
+      <button @click="fullSyncOnce" :disabled="!isOnline">Sync manuel</button>
 
       <label class="inline-label">
         <input type="checkbox" v-model="isOnline" />
         Mode online
       </label>
 
-      <button @click="addManyFakePosts(20)">Générer 20 faux messages</button>
+      <button @click="addManyFakePosts(10)">Factory (10 posts + comments)</button>
       <button @click="fetchTop10Liked">Top 10 les plus likés</button>
     </div>
 
@@ -444,76 +535,71 @@ onMounted(async () => {
 
         <div class="row">
           <button @click="likePost(post)">{{ post.likes > 0 ? '❤️' : '🤍' }} Like</button>
-
           <button @click="startEdit(post)">Modifier</button>
           <button @click="deletePost(post._id, post._rev)">Supprimer</button>
         </div>
 
+        <!-- COMMENTS -->
         <div class="comments">
-          <h4>Commentaires ({{ post.comments?.length || 0 }})</h4>
+          <h4>Commentaires</h4>
 
-          <!-- Premier commentaire (une seule fois) -->
-          <div v-if="post.comments?.length" class="first-comment">
+          <!-- Premier commentaire (1 seule fois) -->
+          <div v-if="post._id && firstCommentByPost[post._id]" class="first-comment">
             <p>
               <strong>Premier commentaire :</strong><br />
-              <strong>{{ post.comments[0].author }}</strong> — {{ post.comments[0].text }}
+              <strong>{{ firstCommentByPost[post._id]!.author }}</strong>
+              — {{ firstCommentByPost[post._id]!.text }}
             </p>
 
             <div class="row">
-              <button @click="startEditComment(post, post.comments[0])">Modifier</button>
-              <button @click="deleteComment(post, post.comments[0].id)">Supprimer</button>
+              <button
+                @click="startEditComment(post._id!, firstCommentByPost[post._id]!)"
+              >
+                Modifier
+              </button>
+              <button
+                @click="deleteComment(firstCommentByPost[post._id]!._id!, post._id!)"
+              >
+                Supprimer
+              </button>
             </div>
           </div>
 
-          <!-- Aucun commentaire -->
-          <div v-else>
-            <p>Aucun commentaire pour l’instant.</p>
-          </div>
+          <p v-else>Aucun commentaire pour l’instant.</p>
 
-          <!-- Bouton pour afficher les autres -->
-          <div v-if="post.comments && post.comments.length > 1">
-            <button class="toggle-btn" @click="toggleCommentsVisibility(post._id!)">
-              {{
-                commentsVisibility[post._id!]
-                  ? 'Masquer les autres commentaires'
-                  : 'Afficher les autres commentaires'
-              }}
+          <!-- Afficher autres -->
+          <div v-if="post._id && (otherCommentsByPost[post._id]?.length ?? 0) > 0">
+            <button class="toggle-btn" @click="toggleOtherComments(post._id)">
+              {{ commentsVisibility[post._id] ? 'Masquer les autres commentaires' : 'Afficher les autres commentaires' }}
             </button>
 
-            <!-- Les AUTRES commentaires (sauf le premier) -->
-            <ul v-if="commentsVisibility[post._id!]">
-              <li v-for="c in post.comments.slice(1)" :key="c.id">
-                <template
-                  v-if="
-                    editingComment &&
-                    editingComment.postId === post._id &&
-                    editingComment.commentId === c.id
-                  "
-                >
+            <ul v-if="commentsVisibility[post._id]">
+              <li v-for="c in (otherCommentsByPost[post._id] || [])" :key="c._id">
+                <!-- edition -->
+                <template v-if="editingComment && editingComment.commentId === c._id">
                   <input v-model="editingComment.text" type="text" />
                   <div class="row">
-                    <button @click="updateComment(post)">Enregistrer</button>
+                    <button @click="updateComment">Enregistrer</button>
                     <button @click="cancelEditComment">Annuler</button>
                   </div>
                 </template>
 
+                <!-- normal -->
                 <template v-else>
-                  <span>
-                    <strong>{{ c.author }}</strong> — {{ c.text }}
-                  </span>
+                  <span><strong>{{ c.author }}</strong> — {{ c.text }}</span>
                   <div class="row">
-                    <button @click="startEditComment(post, c)">Modifier</button>
-                    <button @click="deleteComment(post, c.id)">Supprimer</button>
+                    <button @click="startEditComment(post._id!, c)">Modifier</button>
+                    <button @click="deleteComment(c._id!, post._id!)">Supprimer</button>
                   </div>
                 </template>
               </li>
             </ul>
           </div>
 
-          <!-- Formulaire d'ajout -->
+          <!-- Formulaire d’ajout -->
           <div v-if="commentingPostId === post._id" class="comment-form">
             <input v-model="newCommentText" type="text" placeholder="Votre commentaire" />
-            <button @click="addComment(post)">Envoyer</button>
+            <button @click="addComment(post._id!)">Envoyer</button>
           </div>
           <button v-else @click="startComment(post._id!)">Ajouter un commentaire</button>
         </div>
@@ -565,7 +651,7 @@ onMounted(async () => {
 /* Barre d’actions en haut */
 .actions {
   display: flex;
-  flex-wrap: wrap; /* passe sur plusieurs lignes si petit écran */
+  flex-wrap: wrap;
   gap: 0.75rem;
   align-items: center;
 }
@@ -607,10 +693,7 @@ input {
   background: #111827;
   color: #f9fafb;
   font-size: 0.95rem;
-  transition:
-    border-color 0.15s ease,
-    box-shadow 0.15s ease,
-    background 0.15s ease;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease, background 0.15s ease;
 }
 
 input::placeholder {
@@ -633,10 +716,7 @@ button {
   border-radius: 999px;
   font-size: 0.9rem;
   font-weight: 500;
-  transition:
-    transform 0.12s ease,
-    box-shadow 0.12s ease,
-    opacity 0.12s ease,
+  transition: transform 0.12s ease, box-shadow 0.12s ease, opacity 0.12s ease,
     background 0.12s ease;
   display: inline-flex;
   align-items: center;
@@ -656,14 +736,13 @@ button:disabled {
   transform: none;
 }
 
-/* Boutons secondaires dans les cartes (Modifier / Supprimer) */
+/* Boutons secondaires dans les cartes */
 .item .row button:nth-child(2) {
   background: linear-gradient(135deg, #3b82f6, #2563eb);
 }
 
 .item .row button:nth-child(3),
 .comments button:last-child {
-  /* Supprimer / Ajouter un commentaire */
   background: linear-gradient(135deg, #ef4444, #b91c1c);
 }
 
@@ -692,7 +771,6 @@ button:disabled {
   color: #9ca3af;
 }
 
-/* Ligne de boutons d’un post (like / modifier / supprimer) */
 .row {
   display: flex;
   flex-wrap: wrap;
@@ -700,7 +778,6 @@ button:disabled {
   margin-top: 0.75rem;
 }
 
-/* Bloc édition d’un post */
 .editBox {
   padding: 1rem;
   border-radius: 12px;
@@ -747,21 +824,19 @@ button:disabled {
   color: #a5b4fc;
 }
 
-/* Premier commentaire (aperçu) */
 .first-comment {
   font-size: 0.88rem;
   margin-bottom: 0.4rem;
   color: #e5e7eb;
 }
 
-/* Formulaire d’ajout de commentaire */
 .comment-form {
   display: flex;
   gap: 0.5rem;
   margin-top: 0.4rem;
 }
 
-/* Bouton "Afficher tous les commentaires" - discret */
+/* Bouton discret "Afficher les autres commentaires" */
 .toggle-btn {
   background: transparent !important;
   color: #94a3b8;
