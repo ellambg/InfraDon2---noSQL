@@ -5,7 +5,6 @@ import PouchFind from 'pouchdb-find'
 
 PouchDB.plugin(PouchFind)
 
-/** ========= Types ========= */
 type DocType = 'post' | 'comment'
 
 interface PostDoc {
@@ -29,12 +28,10 @@ interface CommentDoc {
   created_at: string
 }
 
-/** ========= DB ========= */
 const remoteDb = ref<PouchDB.Database | null>(null)
 const localDb = ref<PouchDB.Database | null>(null)
 const syncHandler = ref<PouchDB.Replication.Sync<{}> | null>(null)
 
-/** ========= UI state ========= */
 const postsData = ref<PostDoc[]>([])
 
 const newPost = ref({
@@ -60,14 +57,38 @@ const editingComment = ref<{
 
 const commentsVisibility = ref<Record<string, boolean>>({})
 
-/** ========= Comment cache (minimal data) ========= */
-const firstCommentByPost = ref<Record<string, CommentDoc | null>>({})
+const lastCommentByPost = ref<Record<string, CommentDoc | null>>({})
 const otherCommentsByPost = ref<Record<string, CommentDoc[]>>({})
 
-/** ========= Helpers ========= */
-const nowIso = () => new Date().toISOString()
+const fetchComments = async (postId: string) => {
+  if (!localDb.value) return
+  try {
+    const res = await localDb.value.find({
+      selector: { type: 'comment', postId },
+      limit: 500,
+    })
 
-// petit helper anti-conflit : re-get et retry (utile pour likes, edits)
+    const comments = (res.docs as CommentDoc[]).sort((a, b) =>
+      b.created_at.localeCompare(a.created_at),
+    )
+
+    lastCommentByPost.value[postId] = comments[0] || null
+
+    otherCommentsByPost.value[postId] = comments.slice(1)
+  } catch (e) {
+    console.error('Erreur fetchComments:', e)
+  }
+}
+
+const attachmentUrlByPost = ref<Record<string, string | null>>({})
+
+const PAGE_SIZE = 10
+const postsBookmark = ref<string | null>(null)
+const hasMorePosts = ref(true)
+
+const nowIso = () => new Date().toISOString()
+const uid = () => `${Date.now()}-${Math.random().toString(16).slice(2)}`
+
 const putWithRetry = async <T extends { _id?: string; _rev?: string }>(
   draft: T,
   merge: (latest: T) => T,
@@ -88,14 +109,16 @@ const putWithRetry = async <T extends { _id?: string; _rev?: string }>(
   }
 }
 
-/** ========= Init / Indexes ========= */
-const initDatabases = async () => {
-  const remote = new PouchDB('http://admin:Infradon2_25!@localhost:5984/infradon2_db1')
-  const local = new PouchDB('infradon2_local')
+const getRemoteUrl = () => {
+  const v = (import.meta as any).env?.VITE_COUCH_URL
+  return v || 'http://admin:Infradon2_25!@localhost:5984/infradon2_db1'
+}
 
+const initDatabases = async () => {
+  const remote = new PouchDB(getRemoteUrl())
+  const local = new PouchDB('infradon2_local')
   remoteDb.value = remote
   localDb.value = local
-
   await createIndexes()
   await startLiveSync()
   await fetchPosts()
@@ -103,24 +126,12 @@ const initDatabases = async () => {
 
 const createIndexes = async () => {
   if (!localDb.value) return
-
-  // Posts: search
-  await localDb.value.createIndex({
-    index: { fields: ['type', 'post_name'] },
-  })
-
-  // Posts: sort likes
-  await localDb.value.createIndex({
-    index: { fields: ['type', 'likes'] },
-  })
-
-  // Comments: by post + date
-  await localDb.value.createIndex({
-    index: { fields: ['type', 'postId', 'created_at'] },
-  })
+  await localDb.value.createIndex({ index: { fields: ['type', 'post_name'] } })
+  await localDb.value.createIndex({ index: { fields: ['type', 'likes'] } })
+  await localDb.value.createIndex({ index: { fields: ['type', 'created_at'] } })
+  await localDb.value.createIndex({ index: { fields: ['type', 'postId', 'created_at'] } })
 }
 
-/** ========= Sync (plus robuste que replicate "one shot") ========= */
 const stopLiveSync = () => {
   if (syncHandler.value) {
     syncHandler.value.cancel()
@@ -131,17 +142,14 @@ const stopLiveSync = () => {
 const startLiveSync = async () => {
   if (!localDb.value || !remoteDb.value) return
   stopLiveSync()
-
   syncHandler.value = localDb.value
     .sync(remoteDb.value, { live: true, retry: true })
     .on('change', async () => {
-      // refresh simple et fiable
       await fetchPosts()
     })
     .on('error', (err) => console.error('Sync error:', err))
 }
 
-// bouton sync manuel si tu veux le garder
 const fullSyncOnce = async () => {
   if (!localDb.value || !remoteDb.value) return
   try {
@@ -153,32 +161,107 @@ const fullSyncOnce = async () => {
   }
 }
 
-/** ========= Queries (NO allDocs) ========= */
-const fetchPosts = async () => {
-  if (!localDb.value) return
+const revokeUrl = (postId: string) => {
+  const url = attachmentUrlByPost.value[postId]
+  if (url) URL.revokeObjectURL(url)
+  attachmentUrlByPost.value[postId] = null
+}
 
+const loadAttachmentPreview = async (postId: string) => {
+  if (!localDb.value) return
+  try {
+    const blob = (await localDb.value.getAttachment(postId, 'media')) as any
+    if (!blob) {
+      revokeUrl(postId)
+      return
+    }
+    revokeUrl(postId)
+    attachmentUrlByPost.value[postId] = URL.createObjectURL(blob as Blob)
+  } catch {
+    revokeUrl(postId)
+  }
+}
+
+const addMediaToPost = async (post: PostDoc, file: File) => {
+  if (!localDb.value || !post._id) return
+  try {
+    const latest = (await localDb.value.get(post._id)) as PostDoc
+    await localDb.value.putAttachment(
+      latest._id!,
+      'media',
+      latest._rev!,
+      file,
+      file.type || 'application/octet-stream',
+    )
+    await loadAttachmentPreview(post._id)
+  } catch (e) {
+    console.error('Erreur addMediaToPost:', e)
+  }
+}
+
+const deleteMediaFromPost = async (post: PostDoc) => {
+  if (!localDb.value || !post._id) return
+  try {
+    const latest: any = await localDb.value.get(post._id)
+    await localDb.value.removeAttachment(post._id, 'media', latest._rev)
+    revokeUrl(post._id)
+  } catch (e) {
+    console.error('Erreur deleteMediaFromPost:', e)
+  }
+}
+
+const buildPostsQuery = (bookmark?: string | null) => {
   const term = searchTerm.value.trim()
   const selector: any = { type: 'post' as DocType }
-
   if (term) selector.post_name = { $regex: term }
 
-  const query: any = {
-    selector,
-    limit: 200, // IMPORTANT: pas 25 par défaut
-  }
+  const query: any = { selector, limit: PAGE_SIZE }
+  if (bookmark) query.bookmark = bookmark
 
-  // sort by likes
   if (sortByLikes.value) {
     selector.likes = { $gte: 0 }
     query.sort = [{ type: 'asc' }, { likes: 'desc' }]
+  } else {
+    selector.created_at = { $gte: '' }
+    query.sort = [{ type: 'asc' }, { created_at: 'desc' }]
   }
+  return query
+}
+
+const fetchPosts = async () => {
+  if (!localDb.value) return
+  postsBookmark.value = null
+  hasMorePosts.value = true
 
   try {
-    const res = await localDb.value.find(query)
+    const res: any = await localDb.value.find(buildPostsQuery(null))
+    Object.keys(attachmentUrlByPost.value).forEach((id) => revokeUrl(id))
     postsData.value = res.docs as PostDoc[]
-    await fetchFirstCommentsForPosts(postsData.value)
+    postsBookmark.value = res.bookmark || null
+    hasMorePosts.value = (postsData.value?.length || 0) === PAGE_SIZE
+
+    await Promise.all(postsData.value.filter((p) => p._id).map((p) => fetchComments(p._id!)))
+    await Promise.all(
+      postsData.value.filter((p) => p._id).map((p) => loadAttachmentPreview(p._id!)),
+    )
   } catch (e) {
     console.error('Erreur fetchPosts:', e)
+  }
+}
+
+const loadMorePosts = async () => {
+  if (!localDb.value || !hasMorePosts.value) return
+  try {
+    const res: any = await localDb.value.find(buildPostsQuery(postsBookmark.value))
+    const nextDocs = res.docs as PostDoc[]
+    postsData.value = [...postsData.value, ...nextDocs]
+    postsBookmark.value = res.bookmark || null
+    hasMorePosts.value = (nextDocs?.length || 0) === PAGE_SIZE
+
+    await Promise.all(nextDocs.filter((p) => p._id).map((p) => fetchComments(p._id!)))
+    await Promise.all(nextDocs.filter((p) => p._id).map((p) => loadAttachmentPreview(p._id!)))
+  } catch (e) {
+    console.error('Erreur loadMorePosts:', e)
   }
 }
 
@@ -191,13 +274,18 @@ const fetchTop10Liked = async () => {
       limit: 10,
     })
     postsData.value = res.docs as PostDoc[]
-    await fetchFirstCommentsForPosts(postsData.value)
+    postsBookmark.value = null
+    hasMorePosts.value = false
+
+    await Promise.all(postsData.value.filter((p) => p._id).map((p) => fetchComments(p._id!)))
+    await Promise.all(
+      postsData.value.filter((p) => p._id).map((p) => loadAttachmentPreview(p._id!)),
+    )
   } catch (e) {
     console.error('Erreur fetchTop10Liked:', e)
   }
 }
 
-/** ========= Posts CRUD ========= */
 const addPost = async () => {
   if (!localDb.value) return
 
@@ -208,7 +296,7 @@ const addPost = async () => {
   if (!post_name || !post_content) return
 
   const doc: PostDoc = {
-    _id: `post:${nowIso()}`,
+    _id: `post:${uid()}`,
     type: 'post',
     post_name,
     post_content,
@@ -243,15 +331,12 @@ const updatePost = async () => {
   doc.attributes = (doc.attributes || []).map((a) => String(a).trim()).filter(Boolean)
 
   try {
-    await putWithRetry<PostDoc>(
-      doc,
-      (latest) => ({
-        ...latest,
-        post_name: doc.post_name,
-        post_content: doc.post_content,
-        attributes: doc.attributes,
-      }),
-    )
+    await putWithRetry<PostDoc>(doc, (latest) => ({
+      ...latest,
+      post_name: doc.post_name,
+      post_content: doc.post_content,
+      attributes: doc.attributes,
+    }))
     editingPost.value = null
     await fetchPosts()
   } catch (e) {
@@ -263,10 +348,8 @@ const deletePost = async (id?: string, rev?: string) => {
   if (!localDb.value || !id || !rev) return
 
   try {
-    // delete post
     await localDb.value.remove(id, rev)
 
-    // delete all linked comments (collection séparée)
     const commRes = await localDb.value.find({
       selector: { type: 'comment', postId: id },
       limit: 500,
@@ -276,6 +359,11 @@ const deletePost = async (id?: string, rev?: string) => {
       const toDelete = (commRes.docs as CommentDoc[]).map((c) => ({ ...c, _deleted: true }))
       await localDb.value.bulkDocs(toDelete as any)
     }
+
+    revokeUrl(id)
+    delete lastCommentByPost.value[id]
+    delete otherCommentsByPost.value[id]
+    delete commentsVisibility.value[id]
 
     await fetchPosts()
   } catch (e) {
@@ -287,18 +375,15 @@ const likePost = async (post: PostDoc) => {
   if (!localDb.value || !post._id) return
   try {
     const latest = (await localDb.value.get(post._id)) as PostDoc
-    latest.likes = (latest.likes || 0) + 1
-    await putWithRetry<PostDoc>(
-      latest,
-      (l) => ({ ...l, likes: (l.likes || 0) + 1 }),
-    )
+
+    await putWithRetry<PostDoc>(latest, (l) => ({ ...l, likes: (l.likes || 0) + 1 }))
+
     await fetchPosts()
   } catch (e) {
     console.error('Erreur likePost:', e)
   }
 }
 
-/** ========= Comments ========= */
 const startComment = (postId: string) => {
   commentingPostId.value = postId
   newCommentText.value = ''
@@ -311,7 +396,7 @@ const addComment = async (postId: string) => {
   if (!txt) return
 
   const doc: CommentDoc = {
-    _id: `comment:${nowIso()}`,
+    _id: `comment:${uid()}`,
     type: 'comment',
     postId,
     author: 'Anonyme',
@@ -323,9 +408,7 @@ const addComment = async (postId: string) => {
     await localDb.value.put(doc)
     newCommentText.value = ''
     commentingPostId.value = null
-
-    await fetchFirstComment(postId)
-    if (commentsVisibility.value[postId]) await fetchOtherComments(postId)
+    await fetchComments(postId)
   } catch (e) {
     console.error('Erreur addComment:', e)
   }
@@ -336,8 +419,7 @@ const deleteComment = async (commentId: string, postId: string) => {
   try {
     const doc = (await localDb.value.get(commentId)) as CommentDoc
     await localDb.value.remove(doc._id!, doc._rev!)
-    await fetchFirstComment(postId)
-    if (commentsVisibility.value[postId]) await fetchOtherComments(postId)
+    await fetchComments(postId)
   } catch (e) {
     console.error('Erreur deleteComment:', e)
   }
@@ -356,62 +438,24 @@ const updateComment = async () => {
   try {
     const doc = (await localDb.value.get(editingComment.value.commentId)) as CommentDoc
     doc.text = editingComment.value.text.trim()
-    await putWithRetry<CommentDoc>(
-      doc,
-      (latest) => ({ ...latest, text: doc.text }),
-    )
+    await putWithRetry<CommentDoc>(doc, (latest) => ({ ...latest, text: doc.text }))
 
     const postId = editingComment.value.postId
     editingComment.value = null
-    await fetchFirstComment(postId)
-    if (commentsVisibility.value[postId]) await fetchOtherComments(postId)
+    await fetchComments(postId)
   } catch (e) {
     console.error('Erreur updateComment:', e)
   }
 }
 
-/** ========= Minimal comments loading ========= */
-const fetchFirstComment = async (postId: string) => {
-  if (!localDb.value) return
-  try {
-    const res = await localDb.value.find({
-      selector: { type: 'comment', postId },
-      sort: [{ type: 'asc' }, { postId: 'asc' }, { created_at: 'asc' }],
-      limit: 1,
-    })
-    firstCommentByPost.value[postId] = (res.docs[0] as CommentDoc) || null
-  } catch (e) {
-    console.error('Erreur fetchFirstComment:', e)
-  }
-}
-
-const fetchFirstCommentsForPosts = async (posts: PostDoc[]) => {
-  await Promise.all(posts.filter(p => p._id).map(p => fetchFirstComment(p._id!)))
-}
-
-const fetchOtherComments = async (postId: string) => {
-  if (!localDb.value) return
-  try {
-    const res = await localDb.value.find({
-      selector: { type: 'comment', postId },
-      sort: [{ type: 'asc' }, { postId: 'asc' }, { created_at: 'asc' }],
-      limit: 500,
-    })
-    const all = res.docs as CommentDoc[]
-    otherCommentsByPost.value[postId] = all.slice(1) // exclude first
-  } catch (e) {
-    console.error('Erreur fetchOtherComments:', e)
-  }
-}
-
 const toggleOtherComments = async (postId: string) => {
   commentsVisibility.value[postId] = !commentsVisibility.value[postId]
+  // Optional: refresh comments when showing
   if (commentsVisibility.value[postId]) {
-    await fetchOtherComments(postId)
+    await fetchComments(postId)
   }
 }
 
-/** ========= Factory (DB vide -> fonctionne) ========= */
 const createFakePost = (i: number): Omit<PostDoc, '_id' | '_rev'> => ({
   type: 'post',
   post_name: `Message ${i}`,
@@ -428,7 +472,7 @@ const addManyFakePosts = async (count = 10) => {
   const createdPostIds: string[] = []
 
   for (let i = 0; i < count; i++) {
-    const id = `post:${nowIso()}-${i}`
+    const id = `post:${uid()}`
     createdPostIds.push(id)
     docs.push({
       _id: id,
@@ -437,13 +481,12 @@ const addManyFakePosts = async (count = 10) => {
     } as PostDoc)
   }
 
-  // ajoute aussi quelques commentaires séparés
   for (let i = 0; i < createdPostIds.length; i++) {
     const postId = createdPostIds[i]
-    const howMany = 1 + Math.floor(Math.random() * 3) // 1 à 3 commentaires
+    const howMany = 1 + Math.floor(Math.random() * 3)
     for (let j = 0; j < howMany; j++) {
       docs.push({
-        _id: `comment:${nowIso()}-${i}-${j}`,
+        _id: `comment:${uid()}`,
         type: 'comment',
         postId,
         author: 'Anonyme',
@@ -461,7 +504,6 @@ const addManyFakePosts = async (count = 10) => {
   }
 }
 
-/** ========= Watchers / lifecycle ========= */
 watch([searchTerm, sortByLikes], () => {
   fetchPosts()
 })
@@ -477,402 +519,410 @@ onMounted(async () => {
 </script>
 
 <template>
-  <div class="container">
-    <h1>InfraDon - CouchDB + Vue 3</h1>
-
-    <div class="actions">
-      <button @click="fetchPosts">Rafraîchir (find)</button>
-      <button @click="fullSyncOnce" :disabled="!isOnline">Sync manuel</button>
-
-      <label class="inline-label">
-        <input type="checkbox" v-model="isOnline" />
-        Mode online
-      </label>
-
-      <button @click="addManyFakePosts(10)">Factory (10 posts + comments)</button>
-      <button @click="fetchTop10Liked">Top 10 les plus likés</button>
-    </div>
-
-    <div class="search-bar">
-      <input v-model="searchTerm" type="text" placeholder="Rechercher par nom" />
-      <label class="inline-label">
-        <input type="checkbox" v-model="sortByLikes" />
-        Trier par likes
-      </label>
-    </div>
-
-    <div class="form">
-      <h2>Ajouter un document</h2>
-
-      <input v-model="newPost.post_name" placeholder="Nom (post_name)" type="text" />
-      <input
-        v-model="newPost.post_content"
-        placeholder="Contenu / Description (post_content)"
-        type="text"
-      />
-      <input
-        :value="(newPost.attributes || []).join(', ')"
-        placeholder="Attributs séparés par des virgules"
-        type="text"
-        @input="newPost.attributes = ($event.target as HTMLInputElement).value.split(',')"
-      />
-      <button @click="addPost">Ajouter</button>
-    </div>
-
-    <hr />
-
-    <div v-if="postsData.length === 0">
-      <p>Aucune donnée trouvée.</p>
-    </div>
-
-    <article v-for="post in postsData" :key="post._id" class="item">
-      <!-- vue normale -->
-      <template v-if="!editingPost || editingPost._id !== post._id">
-        <h2>{{ post.post_name }}</h2>
-        <p>{{ post.post_content }}</p>
-        <p>Attributs : {{ (post.attributes || []).join(', ') }}</p>
-        <p>Likes : {{ post.likes || 0 }}</p>
-
-        <div class="row">
-          <button @click="likePost(post)">{{ post.likes > 0 ? '❤️' : '🤍' }} Like</button>
-          <button @click="startEdit(post)">Modifier</button>
-          <button @click="deletePost(post._id, post._rev)">Supprimer</button>
+  <div class="app">
+    <div class="wrap">
+      <header class="top">
+        <div class="brand">
+          <div class="dot" />
+          <div>
+            <h1>InfraDon2</h1>
+            <p>CouchDB / PouchDB + Vue 3</p>
+          </div>
         </div>
 
-        <!-- COMMENTS -->
-        <div class="comments">
-          <h4>Commentaires</h4>
+        <div class="toolbar">
+          <button class="btn" @click="fetchPosts">Rafraîchir</button>
+          <button class="btn" @click="fullSyncOnce" :disabled="!isOnline">Sync manuel</button>
 
-          <!-- Premier commentaire (1 seule fois) -->
-          <div v-if="post._id && firstCommentByPost[post._id]" class="first-comment">
-            <p>
-              <strong>Premier commentaire :</strong><br />
-              <strong>{{ firstCommentByPost[post._id]!.author }}</strong>
-              — {{ firstCommentByPost[post._id]!.text }}
-            </p>
+          <label class="toggle">
+            <input type="checkbox" v-model="isOnline" />
+            <span class="pill" :class="{ on: isOnline }">{{
+              isOnline ? 'Online' : 'Offline'
+            }}</span>
+          </label>
 
-            <div class="row">
-              <button
-                @click="startEditComment(post._id!, firstCommentByPost[post._id]!)"
-              >
-                Modifier
-              </button>
-              <button
-                @click="deleteComment(firstCommentByPost[post._id]!._id!, post._id!)"
-              >
-                Supprimer
-              </button>
+          <button class="btn" @click="addManyFakePosts(10)">Factory</button>
+          <button class="btn" @click="fetchTop10Liked">Top 10 likes</button>
+        </div>
+      </header>
+
+      <section class="panel">
+        <div class="search">
+          <input v-model="searchTerm" type="text" placeholder="Rechercher par nom" />
+          <label class="check">
+            <input type="checkbox" v-model="sortByLikes" />
+            <span>Trier par likes</span>
+          </label>
+        </div>
+
+        <div class="create">
+          <div class="head">
+            <h2>Ajouter un post</h2>
+          </div>
+
+          <div class="grid">
+            <div class="field">
+              <span>Nom</span>
+              <input v-model="newPost.post_name" placeholder="Nom du post" type="text" />
             </div>
-          </div>
+            <div class="field">
+              <span>Contenu</span>
+              <input v-model="newPost.post_content" placeholder="Contenu du post" type="text" />
+            </div>
+            <div class="field full">
+              <span>Attributs</span>
+              <input
+                :value="(newPost.attributes || []).join(', ')"
+                placeholder="ex: demo, pair"
+                type="text"
+                @input="
+                  newPost.attributes = ($event.target as HTMLInputElement).value
+                    .split(',')
+                    .map((s) => s.trim())
+                    .filter(Boolean)
+                "
+              />
+            </div>
 
-          <p v-else>Aucun commentaire pour l’instant.</p>
-
-          <!-- Afficher autres -->
-          <div v-if="post._id && (otherCommentsByPost[post._id]?.length ?? 0) > 0">
-            <button class="toggle-btn" @click="toggleOtherComments(post._id)">
-              {{ commentsVisibility[post._id] ? 'Masquer les autres commentaires' : 'Afficher les autres commentaires' }}
-            </button>
-
-            <ul v-if="commentsVisibility[post._id]">
-              <li v-for="c in (otherCommentsByPost[post._id] || [])" :key="c._id">
-                <!-- edition -->
-                <template v-if="editingComment && editingComment.commentId === c._id">
-                  <input v-model="editingComment.text" type="text" />
-                  <div class="row">
-                    <button @click="updateComment">Enregistrer</button>
-                    <button @click="cancelEditComment">Annuler</button>
-                  </div>
-                </template>
-
-                <!-- normal -->
-                <template v-else>
-                  <span><strong>{{ c.author }}</strong> — {{ c.text }}</span>
-                  <div class="row">
-                    <button @click="startEditComment(post._id!, c)">Modifier</button>
-                    <button @click="deleteComment(c._id!, post._id!)">Supprimer</button>
-                  </div>
-                </template>
-              </li>
-            </ul>
-          </div>
-
-          <!-- Formulaire d’ajout -->
-          <div v-if="commentingPostId === post._id" class="comment-form">
-            <input v-model="newCommentText" type="text" placeholder="Votre commentaire" />
-            <button @click="addComment(post._id!)">Envoyer</button>
-          </div>
-          <button v-else @click="startComment(post._id!)">Ajouter un commentaire</button>
-        </div>
-      </template>
-
-      <!-- mode édition post -->
-      <template v-else>
-        <div class="editBox">
-          <h3>Modifier le document</h3>
-          <input v-model="editingPost.post_name" placeholder="Nom (post_name)" type="text" />
-          <input
-            v-model="editingPost.post_content"
-            placeholder="Contenu / Description"
-            type="text"
-          />
-          <input
-            :value="(editingPost.attributes || []).join(', ')"
-            placeholder="Attributs (séparés par des virgules)"
-            type="text"
-            @input="
-              editingPost &&
-              (editingPost.attributes = ($event.target as HTMLInputElement).value
-                .split(',')
-                .map((s) => s.trim()))
-            "
-          />
-          <div class="row">
-            <button @click="updatePost">Enregistrer</button>
-            <button @click="cancelEdit">Annuler</button>
+            <button class="btn primary" @click="addPost">Ajouter</button>
           </div>
         </div>
-      </template>
-    </article>
+      </section>
+
+      <section v-if="postsData.length === 0" class="empty">
+        <p>Aucune donnée trouvée.</p>
+      </section>
+
+      <section class="list">
+        <article v-for="post in postsData" :key="post._id" class="card">
+          <template v-if="!editingPost || editingPost._id !== post._id">
+            <div class="cardTop">
+              <div class="title">
+                <h3>{{ post.post_name }}</h3>
+                <div class="badges">
+                  <span v-for="(a, idx) in post.attributes || []" :key="idx" class="badge">{{
+                    a
+                  }}</span>
+                </div>
+              </div>
+
+              <div class="right">
+                <div class="likes">
+                  <span class="icon">❤️</span>
+                  <span class="value">{{ post.likes || 0 }}</span>
+                </div>
+
+                <div class="actions">
+                  <button class="btn" @click="startEdit(post)">Modifier</button>
+                  <button class="btn danger" @click="deletePost(post._id, post._rev)">
+                    Supprimer
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <p class="content">{{ post.post_content }}</p>
+
+            <div class="media" v-if="post._id">
+              <div class="preview" v-if="attachmentUrlByPost[post._id]">
+                <img :src="attachmentUrlByPost[post._id]!" alt="media" />
+                <button class="btn danger sm" @click="deleteMediaFromPost(post)">
+                  Supprimer le média
+                </button>
+              </div>
+
+              <div class="upload">
+                <span>Ajouter un média</span>
+                <input
+                  class="file"
+                  type="file"
+                  accept="image/*"
+                  @change="
+                    (e) => {
+                      const f = (e.target as HTMLInputElement).files?.[0]
+                      if (f) addMediaToPost(post, f)
+                    }
+                  "
+                />
+              </div>
+            </div>
+
+            <div class="comments">
+              <div class="commentsTop">
+                <h4>Commentaires</h4>
+                <button
+                  class="btn sm"
+                  v-if="post._id && commentingPostId !== post._id"
+                  @click="startComment(post._id!)"
+                >
+                  Ajouter
+                </button>
+              </div>
+
+              <div v-if="post._id && lastCommentByPost[post._id]" class="last">
+                <div class="line">
+                  <span class="k">Dernier commentaire :</span>
+                  <span class="v"
+                    ><strong>{{ lastCommentByPost[post._id]!.author }}</strong> —
+                    {{ lastCommentByPost[post._id]!.text }}</span
+                  >
+                </div>
+                <div class="actions">
+                  <button
+                    class="btn sm"
+                    @click="startEditComment(post._id!, lastCommentByPost[post._id]!)"
+                  >
+                    Modifier
+                  </button>
+                  <button
+                    class="btn danger sm"
+                    @click="deleteComment(lastCommentByPost[post._id]!._id!, post._id!)"
+                  >
+                    Supprimer
+                  </button>
+                </div>
+              </div>
+
+              <p v-else class="muted">Aucun commentaire.</p>
+
+              <div v-if="post._id && (otherCommentsByPost[post._id]?.length ?? 0) > 0" class="more">
+                <button class="btn ghost sm" @click="toggleOtherComments(post._id)">
+                  {{ commentsVisibility[post._id] ? 'Masquer les autres' : 'Afficher les autres' }}
+                </button>
+
+                <ul v-if="commentsVisibility[post._id]" class="commentList">
+                  <li v-for="c in otherCommentsByPost[post._id] || []" :key="c._id" class="comment">
+                    <template v-if="editingComment && editingComment.commentId === c._id">
+                      <input v-model="editingComment.text" type="text" />
+                      <div class="actions">
+                        <button class="btn primary sm" @click="updateComment">Enregistrer</button>
+                        <button class="btn ghost sm" @click="cancelEditComment">Annuler</button>
+                      </div>
+                    </template>
+
+                    <template v-else>
+                      <div class="line">
+                        <span class="v"
+                          ><strong>{{ c.author }}</strong> — {{ c.text }}</span
+                        >
+                      </div>
+                      <div class="actions">
+                        <button class="btn sm" @click="startEditComment(post._id!, c)">
+                          Modifier
+                        </button>
+                        <button class="btn danger sm" @click="deleteComment(c._id!, post._id!)">
+                          Supprimer
+                        </button>
+                      </div>
+                    </template>
+                  </li>
+                </ul>
+              </div>
+
+              <div v-if="commentingPostId === post._id" class="commentForm">
+                <input v-model="newCommentText" type="text" placeholder="Votre commentaire" />
+                <div class="actions">
+                  <button class="btn primary sm" @click="addComment(post._id!)">Envoyer</button>
+                  <button class="btn ghost sm" @click="commentingPostId = null">Annuler</button>
+                </div>
+              </div>
+            </div>
+          </template>
+
+          <template v-else>
+            <div class="edit">
+              <div class="head">
+                <h3>Modifier le post</h3>
+              </div>
+
+              <div class="grid">
+                <div class="field">
+                  <span>Nom</span>
+                  <input v-model="editingPost.post_name" type="text" />
+                </div>
+                <div class="field">
+                  <span>Contenu</span>
+                  <input v-model="editingPost.post_content" type="text" />
+                </div>
+                <div class="field full">
+                  <span>Attributs</span>
+                  <input
+                    :value="(editingPost.attributes || []).join(', ')"
+                    type="text"
+                    @input="
+                      editingPost &&
+                      (editingPost.attributes = ($event.target as HTMLInputElement).value
+                        .split(',')
+                        .map((s) => s.trim())
+                        .filter(Boolean))
+                    "
+                  />
+                </div>
+              </div>
+
+              <div class="actions">
+                <button class="btn primary" @click="updatePost">Enregistrer</button>
+                <button class="btn ghost" @click="cancelEdit">Annuler</button>
+              </div>
+            </div>
+          </template>
+        </article>
+
+        <div class="pager" v-if="postsData.length > 0">
+          <button class="btn" @click="loadMorePosts" :disabled="!hasMorePosts">
+            Afficher les 10 suivants
+          </button>
+        </div>
+      </section>
+    </div>
   </div>
 </template>
 
 <style scoped>
-.container {
+/* Thème sombre de style « Instagram » */
+.app {
   min-height: 100vh;
-  padding: 2rem 1.5rem;
-  max-width: 960px;
-  margin: 0 auto;
+  background: #121212; /* fond très sombre */
+  color: #f5f5f5; /* texte clair */
+}
+
+/* Barre d’en-tête */
+.top {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 16px;
+  padding: 16px 18px;
+  margin-bottom: 20px;
+  border-radius: 16px;
+  background: #181818;
+  border: 1px solid #262626;
+}
+
+/* Panneau (recherche + ajout de post) */
+.panel {
+  background: #181818;
+  border: 1px solid #262626;
+  border-radius: 20px;
+  padding: 20px;
+  margin-bottom: 28px;
+}
+
+/* Cartes de posts */
+.card {
+  background: #181818;
+  border: 1px solid #262626;
+  border-radius: 16px;
+  padding: 16px;
+}
+
+/* Boutons génériques */
+.btn {
+  border-radius: 999px;
+  padding: 8px 14px;
+  font-size: 13px;
+  background: #262626;
   color: #f5f5f5;
-  display: flex;
-  flex-direction: column;
-  gap: 1.5rem;
+  border: 1px solid #3f3f46;
+  cursor: pointer;
+}
+.btn:hover {
+  background: #333333;
 }
 
-/* Barre d’actions en haut */
-.actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.75rem;
-  align-items: center;
+/* Bouton principal (rose/violet à la manière d’Instagram) */
+.btn.primary {
+  background: #e1306c;
+  border-color: #e1306c;
+  color: #f5f5f5;
+}
+.btn.primary:hover {
+  background: #c72e63;
 }
 
-.search-bar {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.75rem;
+/* Bouton danger */
+.btn.danger {
+  background: #dc3545;
+  border-color: #dc3545;
+  color: #f5f5f5;
+}
+.btn.danger:hover {
+  background: #b02a37;
 }
 
-.inline-label {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.35rem;
-  font-size: 0.9rem;
-  opacity: 0.9;
+/* Boutons fantômes */
+.btn.ghost {
+  border: none;
+  background: transparent;
+  color: #f5f5f5;
+}
+.btn.ghost:hover {
+  background: #262626;
 }
 
-/* Carte formulaire */
-.form {
-  background: linear-gradient(135deg, #1f2933, #111827);
-  border-radius: 12px;
-  padding: 1.5rem;
-  display: flex;
-  flex-direction: column;
-  gap: 0.75rem;
-  box-shadow: 0 14px 30px rgba(0, 0, 0, 0.35);
+/* Boutons de petite taille */
+.btn.sm {
+  padding: 6px 10px;
+  font-size: 12px;
 }
 
-.form h2 {
-  margin: 0 0 0.5rem;
-}
-
-/* Inputs + boutons */
+/* Champs de saisie */
 input {
-  padding: 0.6rem 0.75rem;
-  border-radius: 8px;
-  border: 1px solid #374151;
-  background: #111827;
-  color: #f9fafb;
-  font-size: 0.95rem;
-  transition: border-color 0.15s ease, box-shadow 0.15s ease, background 0.15s ease;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid #262626;
+  background: #181818;
+  color: #f5f5f5;
+  font-size: 13px;
 }
-
 input::placeholder {
   color: #6b7280;
 }
-
 input:focus {
   outline: none;
-  border-color: #10b981;
-  box-shadow: 0 0 0 1px rgba(16, 185, 129, 0.6);
-  background: #020617;
+  border-color: #e1306c;
 }
 
-button {
-  background: linear-gradient(135deg, #10b981, #059669);
-  color: #f9fafb;
-  padding: 0.55rem 0.9rem;
-  border: none;
-  cursor: pointer;
-  border-radius: 999px;
-  font-size: 0.9rem;
-  font-weight: 500;
-  transition: transform 0.12s ease, box-shadow 0.12s ease, opacity 0.12s ease,
-    background 0.12s ease;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 0.25rem;
-}
-
-button:hover {
-  transform: translateY(-1px);
-  box-shadow: 0 10px 20px rgba(16, 185, 129, 0.35);
-}
-
-button:disabled {
-  opacity: 0.5;
-  cursor: default;
-  box-shadow: none;
-  transform: none;
-}
-
-/* Boutons secondaires dans les cartes */
-.item .row button:nth-child(2) {
-  background: linear-gradient(135deg, #3b82f6, #2563eb);
-}
-
-.item .row button:nth-child(3),
-.comments button:last-child {
-  background: linear-gradient(135deg, #ef4444, #b91c1c);
-}
-
-/* Carte d’un post */
-.item {
-  background: #020617;
-  border-radius: 14px;
-  padding: 1.25rem 1.25rem 1rem;
-  margin-top: 0.75rem;
-  box-shadow: 0 14px 30px rgba(0, 0, 0, 0.45);
-  border: 1px solid rgba(55, 65, 81, 0.6);
-}
-
-.item h2 {
-  margin: 0 0 0.15rem;
-}
-
-.item p {
-  margin: 0.25rem 0;
-  color: #e5e7eb;
-  font-size: 0.95rem;
-}
-
-.item p:nth-of-type(3) {
-  font-size: 0.85rem;
-  color: #9ca3af;
-}
-
-.row {
+/* Section liste */
+.list {
   display: flex;
-  flex-wrap: wrap;
-  gap: 0.5rem;
-  margin-top: 0.75rem;
+  flex-direction: column;
+  gap: 14px;
+  border-top: 1px solid #262626;
+  padding-top: 24px;
 }
 
-.editBox {
-  padding: 1rem;
+/* Commentaires et « dernier commentaire » */
+.last,
+.comment {
+  margin-top: 10px;
+  padding: 10px;
+  background: #202020;
+  border: 1px solid #333333;
   border-radius: 12px;
-  border: 1px solid #10b981;
-  background: radial-gradient(circle at top left, #064e3b, #020617);
+}
+
+/* État vide */
+.empty {
+  padding: 20px;
+  border-radius: 16px;
+  border: 1px dashed #333333;
+  color: #6b7280;
+  text-align: center;
+}
+
+/* Zone des likes avec icône */
+.likes {
   display: flex;
-  flex-direction: column;
-  gap: 0.6rem;
+  align-items: center;
+  gap: 6px;
 }
-
-.editBox h3 {
-  margin: 0 0 0.5rem;
+.likes .icon {
+  color: #e1306c;
+  font-size: 16px;
 }
-
-/* Commentaires */
-.comments {
-  margin-top: 1rem;
-  border-top: 1px solid #111827;
-  padding-top: 0.75rem;
-}
-
-.comments h4 {
-  margin: 0 0 0.4rem;
-  font-size: 0.9rem;
-  color: #d1d5db;
-}
-
-.comments ul {
-  list-style: none;
-  padding-left: 0;
-  margin: 0 0 0.4rem;
-}
-
-.comments li {
-  margin-bottom: 0.3rem;
-  font-size: 0.85rem;
-  color: #e5e7eb;
-  display: flex;
-  flex-direction: column;
-  gap: 0.4rem;
-}
-
-.comments li strong {
-  color: #a5b4fc;
-}
-
-.first-comment {
-  font-size: 0.88rem;
-  margin-bottom: 0.4rem;
-  color: #e5e7eb;
-}
-
-.comment-form {
-  display: flex;
-  gap: 0.5rem;
-  margin-top: 0.4rem;
-}
-
-/* Bouton discret "Afficher les autres commentaires" */
-.toggle-btn {
-  background: transparent !important;
-  color: #94a3b8;
-  border: 1px solid #334155;
-  font-size: 0.8rem;
-  padding: 0.25rem 0.7rem;
-  border-radius: 999px;
-  opacity: 0.9;
-  margin: 0.5rem 0 0.2rem;
-  box-shadow: none !important;
-}
-
-.toggle-btn:hover {
-  background: #020617 !important;
-  color: #e5e7eb;
-}
-
-/* Responsive */
-@media (max-width: 720px) {
-  .container {
-    padding: 1.25rem 1rem;
-  }
-
-  .form,
-  .item {
-    padding: 1rem;
-  }
-
-  .comment-form {
-    flex-direction: column;
-  }
-
-  .actions,
-  .search-bar {
-    flex-direction: column;
-    align-items: flex-start;
-  }
+.likes .value {
+  color: #f5f5f5;
+  font-weight: bold;
 }
 </style>
